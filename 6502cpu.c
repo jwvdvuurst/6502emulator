@@ -1,19 +1,24 @@
 #include <stdio.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "6502memory.h"
 #include "6502types.h"
 #include "6502io.h"
+#include "6502cpu.h"
 
-BYTE  stackpointer = 0x00;
-BYTE* stack = NULL;
-BYTE  accumulator;
-BYTE  regx;
-BYTE  regy;
-BYTE  procstatus;
-WORD  programcounter = 0xFFFE;
+static cpu_t cpu;
 
-BYTE  current_instruction = {0x00};
+/* compatibility aliases for existing code (will be removed during further refactor) */
+#define stackpointer (cpu.SP)
+#define stack (cpu.stack)
+#define accumulator (cpu.A)
+#define regx (cpu.X)
+#define regy (cpu.Y)
+#define procstatus (cpu.P)
+#define programcounter (cpu.PC)
+#define current_instruction (cpu.current_instruction)
+#define cycles (cpu.cycles)
 
 static bool initialised = false;
 char stat_message[80];
@@ -42,69 +47,15 @@ char stat_message[80];
 #define OVERFLOW_SET   procstatus = (procstatus | (0x01 << OVERFLOW_BIT))
 #define NEGATIVE_SET   procstatus = (procstatus | (0x01 << NEGATIVE_BIT))
 
-#define CARRY_CLEAR      procstatus = (procstatus ^ (0x01 << CARRY_BIT))
-#define ZERO_CLEAR       procstatus = (procstatus ^ (0x01 << ZERO_BIT))
-#define INTERRUPT_CLEAR  procstatus = (procstatus ^ (0x01 << INTERRUPT_BIT))
-#define DECIMAL_CLEAR    procstatus = (procstatus ^ (0x01 << DECIMAL_BIT))
-#define BREAK_CLEAR      procstatus = (procstatus ^ (0x01 << BREAK_BIT))
-#define OVERFLOW_CLEAR   procstatus = (procstatus ^ (0x01 << OVERFLOW_BIT))
-#define NEGATIVE_CLEAR   procstatus = (procstatus ^ (0x01 << NEGATIVE_BIT))
+#define CARRY_CLEAR      procstatus &= ~(0x01 << CARRY_BIT)
+#define ZERO_CLEAR       procstatus &= ~(0x01 << ZERO_BIT)
+#define INTERRUPT_CLEAR  procstatus &= ~(0x01 << INTERRUPT_BIT)
+#define DECIMAL_CLEAR    procstatus &= ~(0x01 << DECIMAL_BIT)
+#define BREAK_CLEAR      procstatus &= ~(0x01 << BREAK_BIT)
+#define OVERFLOW_CLEAR   procstatus &= ~(0x01 << OVERFLOW_BIT)
+#define NEGATIVE_CLEAR   procstatus &= ~(0x01 << NEGATIVE_BIT)
 
-#define NOTI             fprintf(stderr,"Function %s is not implemented\n",__func__);
-#define FETCH_ADDRESS    switch(mode) { \
-                            case INMEDIATE: address = fetch_word(programcounter); \
-                                            programcounter += 2; \
-                                            break; \
-                            case ZEROPAGE:  address = 0x0000 + fetch_byte(programcounter++); \
-                                            break; \
-                            case ABSOLUTE:  value = fetch_byte(programcounter++); \
-                                            break; \
-                            case INDIRECT:  address = fetch_word(programcounter); \
-                                            programcounter += 2; \
-                                            address = fetch_word(address); \
-                                            break; \
-                            case NOMODE:    break; \
-                            default:        NOTI; \
-                                            break; \
-                         }
-#define STATUS           sprintf(stat_message, "OC %s: IN: %02X pc: %04X am: %s\tsp: %02X ps: %02X acc: %02X rx:%02X ry: %02X", \ 
-                                               __func__, current_instruction, programcounter, printMode(mode), \
-                                               stackpointer, procstatus, accumulator, regx, regy); \
-                         write_statmessage(stat_message);
-
-#define EXECUTE_OPCODE(actgen, actin, actzp, actab, actid, actno)   STATUS \
-                                                            bool ok = true; \
-                                                            WORD address = {0x0000}; \
-                                                            BYTE value = {0x00}; \
-                                                            FETCH_ADDRESS \
-                                                            actgen \
-                                                            switch(mode) { \
-                                                                case INMEDIATE: actin; break; \
-                                                                case ZEROPAGE:  actzp; break; \
-                                                                case ABSOLUTE:  actab; break; \
-                                                                case INDIRECT:  actid; break; \
-                                                                case NOMODE:    actno; break; \
-                                                            } \
-                                                            return ok;
-                                                                            
-#define PUSH(a) stack != NULL ? stackpointer < 0xFF ? (stack[stackpointer++] = a, true) : false : false
-#define POP(a)  stack != NULL ? stackpointer > 0x00 ? (a = stack[stackpointer--], true) : false : false
-
-#define IMP NOMODE, NONE
-#define IMM INMEDIATE, NONE
-#define ZP  ZEROPAGE, NONE
-#define ZPX ZEROPAGE, REGX
-#define ZPY ZEROPAGE, REGY
-#define IZX INDIRECT, REGX
-#define IZY INDIRECT, REGY
-#define ABS ABSOLUTE, NONE
-#define ABX ABSOLUTE, REGX
-#define ABY ABSOLUTE, REGY
-#define IND INDIRECT, NONE
-#define REL NOMODE, NONE   //not implemented yet
-
-#define OPCALL(opcde, mde)  ok = ok && opcde(mde); break;
-
+#ifndef MODE_REGISTER_TYPES_DEFINED
 typedef enum {
     INMEDIATE,
     ZEROPAGE,
@@ -118,10 +69,96 @@ typedef enum {
     REGX,
     REGY
 } register_t;
+#define MODE_REGISTER_TYPES_DEFINED 1
+#endif
 
+#define NOTI             fprintf(stderr,"Function %s is not implemented\n",__func__);
+
+static void resolve_address(mode_t mode, register_t reg, WORD *address, BYTE *value) {
+    *address = 0x0000;
+    *value = 0x00;
+    switch(mode) {
+        case INMEDIATE:
+            *value = fetch_byte(programcounter++);
+            break;
+        case ZEROPAGE:
+            *address = (WORD)fetch_byte(programcounter++);
+            break;
+        case ABSOLUTE:
+            *address = fetch_word(programcounter);
+            programcounter += 2;
+            break;
+        case INDIRECT: {
+            WORD ptr = fetch_word(programcounter);
+            programcounter += 2;
+            *address = fetch_word(ptr);
+            break;
+        }
+        case NOMODE:
+            break;
+        default:
+            NOTI;
+            break;
+    }
+
+}
+
+static const char* printMode(mode_t mode) {
+    switch(mode) {
+    case INMEDIATE: return "INMEDIATE"; break;
+    case ZEROPAGE:  return "ZEROPAGE"; break;
+    case ABSOLUTE:  return "ABSOLUTE"; break;
+    case INDIRECT:  return "INDIRECT"; break;
+    case NOMODE:    return "NOMODE"; break;
+    default:        return "**error**"; break;
+    }
+}
+
+static void update_status(mode_t mode, const char *caller) {
+    sprintf(stat_message,
+        "OC %s: IN: %02X pc: %04X am: %s\tsp: %02X ps: %02X acc: %02X rx: %02X ry: %02X",
+        caller, current_instruction, programcounter, printMode(mode),
+        stackpointer, procstatus, accumulator, regx, regy);
+    write_statmessage(stat_message);
+}
+
+#undef STATUS
+#define STATUS update_status(mode, __func__)
+                                                                            
+static inline bool push_byte(BYTE v) {
+    if (stack == NULL) return false;
+    stack[stackpointer] = v;
+    stackpointer--;
+    return true;
+}
+
+static inline bool pop_byte(BYTE *out) {
+    if (stack == NULL) return false;
+    if (stackpointer >= 0xFF) return false;
+    stackpointer++;
+    *out = stack[stackpointer];
+    return true;
+}
+
+#undef PUSH
+#define PUSH(a) push_byte(a)
+#undef POP
+#define POP(a)  pop_byte(&(a))
+
+#define IMP NOMODE, NONE
+#define IMM INMEDIATE, NONE
+#define ZP  ZEROPAGE, NONE
+#define ZPX ZEROPAGE, REGX
+#define ZPY ZEROPAGE, REGY
+#define IZX INDIRECT, REGX
+#define IZY INDIRECT, REGY
+#define ABS ABSOLUTE, NONE
+#define ABX ABSOLUTE, REGX
+#define ABY ABSOLUTE, REGY
+#define IND INDIRECT, NONE
 static bool wpush( WORD a ) {
     if (stack == NULL) return false;
-    if (stackpointer >= 0xFE) return false;
+    if (stackpointer <= 0x01) return false;
     PUSH((BYTE)(a & 0x00FF));
     PUSH((BYTE)((a & 0xFF00)>>8));
     return true;
@@ -129,7 +166,7 @@ static bool wpush( WORD a ) {
 
 static bool wpop( WORD* a ) {
     if (stack == NULL) return false;
-    if (stackpointer <= 0x01) return false;
+    if (stackpointer >= 0xFE) return false;
     BYTE hi = {0x00};
     BYTE lo = {0x00};
     POP(hi);
@@ -138,324 +175,844 @@ static bool wpop( WORD* a ) {
     return true;
 } 
 
-static const char* printMode(mode_t mode) {
-    switch(mode) {
-        case INMEDIATE: return "INMEDIATE"; break;
-        case ZEROPAGE:  return "ZEROPAGE"; break;
-        case ABSOLUTE:  return "ABSOLUTE"; break;
-        case INDIRECT:  return "INDIRECT"; break;
-        case NOMODE:    return "NOMODE"; break;
-        default:        return "**error**"; break;
-    }
-}
-
 // Add with carry
 static inline bool ADC( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE( BYTE addcarry = CARRY_FLAG?1:0; CARRY_CLEAR; , \
-                    value = fetch_byte(address); \
-                    if (accumulator + value + addcarry < 0xFF) { \ 
-                       accumulator += (value + addcarry); \
-                    } else { \
-                       accumulator = (accumulator + value + addcarry) - 0xFF; \
-                       CARRY_SET; \
-                    } , \
-                    value = fetch_byte(address); \
-                    if (accumulator + value + addcarry < 0xFF) { \ 
-                       accumulator += (value + addcarry); \
-                    } else { \
-                       accumulator = (accumulator + value + addcarry) - 0xFF; \
-                       CARRY_SET; \
-                    } , \
-                    if (accumulator + value + addcarry < 0xFF) { \ 
-                       accumulator += (value + addcarry); \
-                    } else { \
-                       accumulator = (accumulator + value + addcarry) - 0xFF; \
-                       CARRY_SET; \
-                    } , \
-                    value = fetch_byte(address); \
-                    if (accumulator + value + addcarry < 0xFF) { \ 
-                       accumulator += (value + addcarry); \
-                    } else { \
-                       accumulator = (accumulator + value + addcarry) - 0xFF; \
-                       CARRY_SET; \
-                    } , \
-                    NOTI )
+     update_status(mode, __func__);
+     WORD address = 0x0000;
+     BYTE value = 0x00;
+     resolve_address(mode, reg, &address, &value);
+
+     BYTE a = accumulator;
+     BYTE addcarry = CARRY_FLAG ? 1 : 0;
+     if (mode == INMEDIATE) {
+          /* value already set */
+     } else {
+          value = fetch_byte(address);
+     }
+     uint16_t sum = (uint16_t)a + (uint16_t)value + (uint16_t)addcarry;
+     if (sum > 0xFF) CARRY_SET; else CARRY_CLEAR;
+     BYTE result = (BYTE)(sum & 0xFF);
+     /* overflow: if sign of a and value are same, but sign of result differs */
+     if ((~(a ^ value) & (a ^ result) & 0x80) != 0) OVERFLOW_SET; else OVERFLOW_CLEAR;
+     accumulator = result;
+     if (accumulator == 0) ZERO_SET; else ZERO_CLEAR;
+     if (accumulator & 0x80) NEGATIVE_SET; else NEGATIVE_CLEAR;
+     return true;
+}
+
+// per-opcode base cycle counts (simple table; refine values as needed)
+static uint8_t opcode_cycles[256];
+
+static void init_opcode_cycles() {
+    // default (safe) value
+    for (int i = 0; i < 256; i++) opcode_cycles[i] = 2;
+
+    // a few known common base-cycle values (not exhaustive)
+    opcode_cycles[0x00] = 7; // BRK
+    opcode_cycles[0x20] = 6; // JSR
+    opcode_cycles[0x4C] = 3; // JMP ABS
+    opcode_cycles[0x6C] = 5; // JMP IND
+    opcode_cycles[0x60] = 6; // RTS
+    opcode_cycles[0x40] = 6; // RTI
+    opcode_cycles[0x69] = 2; // ADC imm
+    opcode_cycles[0x65] = 3; // ADC zp
+    opcode_cycles[0x6D] = 4; // ADC abs
+    opcode_cycles[0x29] = 2; // AND imm
+    opcode_cycles[0x2D] = 4; // AND abs
+    opcode_cycles[0xA9] = 2; // LDA imm
+    opcode_cycles[0xA5] = 3; // LDA zp
+    opcode_cycles[0xAD] = 4; // LDA abs
+    opcode_cycles[0xEA] = 2; // NOP
+    opcode_cycles[0x48] = 3; // PHA
+    opcode_cycles[0x68] = 4; // PLA
+}
+
+typedef bool (*opcode_fn)(mode_t, register_t);
+
+typedef struct {
+    opcode_fn handler;
+    mode_t mode;
+    register_t reg;
+    uint8_t base_cycles;
+} opcode_entry_t;
+
+static opcode_entry_t opcode_table[256];
+
+/* forward declarations for handlers used by the dispatch table */
+static inline bool BRK(mode_t mode, register_t reg);
+static inline bool JSR(mode_t mode, register_t reg);
+static inline bool JMP(mode_t mode, register_t reg);
+static inline bool RTS(mode_t mode, register_t reg);
+static inline bool RTI(mode_t mode, register_t reg);
+static inline bool ADC(mode_t mode, register_t reg);
+static inline bool AND(mode_t mode, register_t reg);
+static inline bool LDA(mode_t mode, register_t reg);
+static inline bool NOP(mode_t mode, register_t reg);
+static inline bool PHA(mode_t mode, register_t reg);
+static inline bool PLA(mode_t mode, register_t reg);
+
+static void init_opcode_table() {
+    for (int i = 0; i < 256; i++) {
+        opcode_table[i].handler = NULL;
+        opcode_table[i].mode = NOMODE;
+        opcode_table[i].reg = NONE;
+        opcode_table[i].base_cycles = opcode_cycles[i];
+    }
+
+    /* populate a small set of implemented opcodes */
+    opcode_table[0x00] = (opcode_entry_t){BRK, IMP, 7};
+    opcode_table[0x20] = (opcode_entry_t){JSR, ABS, 6};
+    opcode_table[0x4C] = (opcode_entry_t){JMP, ABS, 3};
+    opcode_table[0x6C] = (opcode_entry_t){JMP, IND, 5};
+    opcode_table[0x60] = (opcode_entry_t){RTS, IMP, 6};
+    opcode_table[0x40] = (opcode_entry_t){RTI, IMP, 6};
+
+    opcode_table[0x69] = (opcode_entry_t){ADC, IMM, 2};
+    opcode_table[0x65] = (opcode_entry_t){ADC, ZP, 3};
+    opcode_table[0x6D] = (opcode_entry_t){ADC, ABS, 4};
+
+    opcode_table[0x29] = (opcode_entry_t){AND, IMM, 2};
+    opcode_table[0x2D] = (opcode_entry_t){AND, ABS, 4};
+
+    opcode_table[0xA9] = (opcode_entry_t){LDA, IMM, 2};
+    opcode_table[0xA5] = (opcode_entry_t){LDA, ZP, 3};
+    opcode_table[0xAD] = (opcode_entry_t){LDA, ABS, 4};
+
+    opcode_table[0xEA] = (opcode_entry_t){NOP, IMP, 2};
+    opcode_table[0x48] = (opcode_entry_t){PHA, IMP, 3};
+    opcode_table[0x68] = (opcode_entry_t){PLA, IMP, 4};
 }
 
 // arithmetic shift left
 static inline bool ASL( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    switch(mode) {
+        case INMEDIATE: break;
+        case ZEROPAGE:  break;
+        case ABSOLUTE:  break;
+        case INDIRECT:  break;
+        case NOMODE:    break;
+    }
+    return ok;
 }
 // and (with accumulator)
 static inline bool AND( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(value=fetch_byte(address);accumulator&=value;,,,,,);
+    update_status(mode, __func__);
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    if (mode == INMEDIATE) {
+        /* value already set */
+    } else {
+        value = fetch_byte(address);
+    }
+    accumulator &= value;
+    if (accumulator == 0) ZERO_SET; else ZERO_CLEAR;
+    if (accumulator & 0x80) NEGATIVE_SET; else NEGATIVE_CLEAR;
+    return true;
 }
 
 // branch on carry clear
 static inline bool BCC( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    switch(mode) {
+        case INMEDIATE: break;
+        case ZEROPAGE:  break;
+        case ABSOLUTE:  break;
+        case INDIRECT:  break;
+        case NOMODE:    break;
+    }
+    return ok;
 }
 
 // branch on carry set
 static inline bool BCS( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    switch(mode) {
+        case INMEDIATE: break;
+        case ZEROPAGE:  break;
+        case ABSOLUTE:  break;
+        case INDIRECT:  break;
+        case NOMODE:    break;
+    }
+    return ok;
 }
 
 // branch on equal (zero set)
 static inline bool BEQ( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    switch(mode) {
+        case INMEDIATE: break;
+        case ZEROPAGE:  break;
+        case ABSOLUTE:  break;
+        case INDIRECT:  break;
+        case NOMODE:    break;
+    }
+    return ok;
 }
 
 // bit test
 static inline bool BIT( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    switch(mode) {
+        case INMEDIATE: break;
+        case ZEROPAGE:  break;
+        case ABSOLUTE:  break;
+        case INDIRECT:  break;
+        case NOMODE:    break;
+    }
+    return ok;
 }
 
 // branch on minus (negative set)
 static inline bool BMI( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(if(NEGATIVE_SET) programcounter=address;,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    if (mode == ABSOLUTE || mode == INDIRECT || mode == ZEROPAGE) {
+        if (NEGATIVE_FLAG) programcounter = address;
+    }
+    return ok;
 }
 
 // branch on not equal (zero clear)
 static inline bool BNE( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    switch(mode) {
+        case INMEDIATE: break;
+        case ZEROPAGE:  break;
+        case ABSOLUTE:  break;
+        case INDIRECT:  break;
+        case NOMODE:    break;
+    }
+    return ok;
 }
 
 // branch on plus (negative clear)
 static inline bool BPL( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(if(NEGATIVE_SET) {;} else { programcounter=address; },,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    switch(mode) {
+        case INMEDIATE: break;
+        case ZEROPAGE:  break;
+        case ABSOLUTE:  if(!NEGATIVE_FLAG) { programcounter = address; } break;
+        case INDIRECT:  break;
+        case NOMODE:    break;
+    }
+    return ok;
 }
 
 // break / interrupt
 static inline bool BRK( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(,,,,,);
+    update_status(mode, __func__);
+    /* minimal BRK: set BREAK flag and return */
+    BREAK_SET;
+    return true;
 }
 
 // branch on overflow clear
 static inline bool BVC( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    switch(mode) {
+        case INMEDIATE: break;
+        case ZEROPAGE:  break;
+        case ABSOLUTE:  break;
+        case INDIRECT:  break;
+        case NOMODE:    break;
+    }
+    return ok;
 }
 
 // branch on overflow set
 static inline bool BVS( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    switch(mode) {
+        case INMEDIATE: break;
+        case ZEROPAGE:  break;
+        case ABSOLUTE:  break;
+        case INDIRECT:  break;
+        case NOMODE:    break;
+    }
+    return ok;
 }
 
 // clear carry
 static inline bool CLC( mode_t mode, register_t reg ) {
-   EXECUTE_OPCODE(CARRY_CLEAR;,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    CARRY_CLEAR;
+    switch(mode) {
+        case INMEDIATE: break;
+        case ZEROPAGE:  break;
+        case ABSOLUTE:  break;
+        case INDIRECT:  break;
+        case NOMODE:    break;
+    }
+    return ok;
 }
 
 // clear decimal
 static inline bool CLD( mode_t mode, register_t reg ) {
-   EXECUTE_OPCODE(DECIMAL_CLEAR;,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    DECIMAL_CLEAR;
+    switch(mode) {
+        case INMEDIATE: break;
+        case ZEROPAGE:  break;
+        case ABSOLUTE:  break;
+        case INDIRECT:  break;
+        case NOMODE:    break;
+    }
+    return ok;
 }
 
 // clear interrupt disable
 static inline bool CLI( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(INTERRUPT_CLEAR;,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    INTERRUPT_CLEAR;
+    switch(mode) {
+        case INMEDIATE: break;
+        case ZEROPAGE:  break;
+        case ABSOLUTE:  break;
+        case INDIRECT:  break;
+        case NOMODE:    break;
+    }
+    return ok;
 }
 
 // clear overflow
 static inline bool CLV( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(OVERFLOW_CLEAR;,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    OVERFLOW_CLEAR;
+    switch(mode) {
+        case INMEDIATE: break;
+        case ZEROPAGE:  break;
+        case ABSOLUTE:  break;
+        case INDIRECT:  break;
+        case NOMODE:    break;
+    }
+    return ok;
 }
 
 // compare (with accumulator)
 static inline bool CMP( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    if (mode != INMEDIATE) value = fetch_byte(address);
+    switch(mode) {
+        case INMEDIATE: break;
+        case ZEROPAGE:  break;
+        case ABSOLUTE:  break;
+        case INDIRECT:  break;
+        case NOMODE:    break;
+    }
+    return ok;
 }
 
 // compare with X
 static inline bool CPX( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    if (mode != INMEDIATE) value = fetch_byte(address);
+    switch(mode) {
+        case INMEDIATE: break;
+        case ZEROPAGE:  break;
+        case ABSOLUTE:  break;
+        case INDIRECT:  break;
+        case NOMODE:    break;
+    }
+    return ok;
 }
 
 
 // compare with Y
 static inline bool CPY( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    if (mode != INMEDIATE) value = fetch_byte(address);
+    switch(mode) {
+        case INMEDIATE: break;
+        case ZEROPAGE:  break;
+        case ABSOLUTE:  break;
+        case INDIRECT:  break;
+        case NOMODE:    break;
+    }
+    return ok;
 }
 
 // decrement
 static inline bool DEC( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(accumulator--;,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    if (mode == INMEDIATE) {
+        accumulator--;
+    } else {
+        /* no-op for other modes until implemented */
+    }
+    return ok;
 }
 
 // decrement X
 static inline bool DEX( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(regx--;,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    regx--;
+    return ok;
 }
 
 // decrement Y
 static inline bool DEY( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(regy--;,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    regy--;
+    return ok;
 }
 
 // exclusive or (with accumulator)
 static inline bool EOR( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(value=fetch_byte(address);accumulator^=value;,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    if (mode != INMEDIATE) value = fetch_byte(address);
+    accumulator ^= value;
+    if (accumulator == 0) ZERO_SET; else ZERO_CLEAR;
+    if (accumulator & 0x80) NEGATIVE_SET; else NEGATIVE_CLEAR;
+    return ok;
 }
 
 // increment
 static inline bool INC( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(accumulator++;,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    accumulator++;
+    return ok;
 }
 
 // increment X
 static inline bool INX( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(regx++;,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    regx++;
+    return ok;
 }
 
 // increment Y
 static inline bool INY( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(regy++;,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    regy++;
+    return ok;
 }
 
 // jump
 static inline bool JMP( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE( programcounter = address;, , , , , );
+    update_status(mode, __func__);
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    programcounter = address;
+    return true;
 }
 
 // jump subroutine
 static inline bool JSR( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE( wpush(programcounter); programcounter = address;, , , , , );
+    update_status(mode, __func__);
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    wpush(programcounter);
+    programcounter = address;
+    return true;
 }
 
 // load accumulator
 static inline bool LDA( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(value=fetch_byte(address);accumulator=value;,,,,,);
+    update_status(mode, __func__);
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    if (mode == INMEDIATE) {
+        /* value already set */
+    } else {
+        value = fetch_byte(address);
+    }
+    accumulator = value;
+    if (accumulator == 0) ZERO_SET; else ZERO_CLEAR;
+    if (accumulator & 0x80) NEGATIVE_SET; else NEGATIVE_CLEAR;
+    return true;
 }
 
 // load X
 static inline bool LDX( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(value=fetch_byte(address);regx=value;,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    if (mode != INMEDIATE) value = fetch_byte(address);
+    regx = value;
+    if (regx == 0) ZERO_SET; else ZERO_CLEAR;
+    if (regx & 0x80) NEGATIVE_SET; else NEGATIVE_CLEAR;
+    return ok;
 }
 
 // load Y
 static inline bool LDY( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(value=fetch_byte(address);regy=value;,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    if (mode != INMEDIATE) value = fetch_byte(address);
+    regy = value;
+    if (regy == 0) ZERO_SET; else ZERO_CLEAR;
+    if (regy & 0x80) NEGATIVE_SET; else NEGATIVE_CLEAR;
+    return ok;
 }
 
 // logical shift right
 static inline bool LSR( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    switch(mode) {
+        case INMEDIATE: break;
+        case ZEROPAGE:  break;
+        case ABSOLUTE:  break;
+        case INDIRECT:  break;
+        case NOMODE:    break;
+    }
+    return ok;
 }
 
 //  no operation
 static inline bool NOP( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(,,,,,);
+    update_status(mode, __func__);
+    return true;
 }
 
 // or with accumulator
 static inline bool ORA( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(value=fetch_byte(address);accumulator|=value;,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    if (mode != INMEDIATE) value = fetch_byte(address);
+    accumulator |= value;
+    if (accumulator == 0) ZERO_SET; else ZERO_CLEAR;
+    if (accumulator & 0x80) NEGATIVE_SET; else NEGATIVE_CLEAR;
+    return ok;
 }
 
 // push accumulator
 static inline bool PHA( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(PUSH(accumulator);,,,,,);
+    update_status(mode, __func__);
+    PUSH(accumulator);
+    return true;
 } 
 
 // push processor status (SR)
 static inline bool PHP( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(PUSH(procstatus);,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    PUSH(procstatus);
+    return ok;
 }
 
 // pull accumulator
 static inline bool PLA( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(POP(accumulator);,,,,,);
+    update_status(mode, __func__);
+    POP(accumulator);
+    if (accumulator == 0) ZERO_SET; else ZERO_CLEAR;
+    if (accumulator & 0x80) NEGATIVE_SET; else NEGATIVE_CLEAR;
+    return true;
 }
 
 // pull processor status (SR)
 static inline bool PLP( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(POP(procstatus);,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    POP(procstatus);
+    return ok;
 }
 
 // rotate left
 static inline bool ROL( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(BYTE bit=(accumulator & 0x80)>>7;accumulator=(accumulator<<1)+bit;,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    BYTE bit = (accumulator & 0x80) >> 7;
+    accumulator = (accumulator << 1) + bit;
+    return ok;
 }
 
 // rotate right
 static inline bool ROR( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(BYTE bit=(accumulator & 0x01)<<7;accumulator=(accumulator>>1)+bit;,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    BYTE bit = (accumulator & 0x01) << 7;
+    accumulator = (accumulator >> 1) + bit;
+    return ok;
 }
 
 // return from interrupt
 static inline bool RTI( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE( wpop(&programcounter);, , , , , );
+    update_status(mode, __func__);
+    /* simple RTI: pop status then PC */
+    POP(procstatus);
+    wpop(&programcounter);
+    return true;
 }
 
 // return from subroutine
 static inline bool RTS( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE( wpop(&programcounter);, , , , , );
+    update_status(mode, __func__);
+    wpop(&programcounter);
+    return true;
 }
 
 // subtract with carry
 static inline bool SBC( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    if (mode != INMEDIATE) value = fetch_byte(address);
+    switch(mode) {
+        case INMEDIATE: break;
+        case ZEROPAGE:  break;
+        case ABSOLUTE:  break;
+        case INDIRECT:  break;
+        case NOMODE:    break;
+    }
+    return ok;
 }
 
 // set carry
 static inline bool SEC( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(CARRY_SET;,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    CARRY_SET;
+    return ok;
 }
 
 // set decimal
 static inline bool SED( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(DECIMAL_SET;,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    DECIMAL_SET;
+    return ok;
 }
 
 // set interrupt disable
 static inline bool SEI( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    INTERRUPT_SET;
+    return ok;
 }
 
 // store accumulator
 static inline bool STA( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(store_byte(address,accumulator);,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    store_byte(address, accumulator);
+    return ok;
 }
 
 // store X
 static inline bool STX( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(store_byte(address,regx);,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    store_byte(address, regx);
+    return ok;
 }
 
 // store Y
 static inline bool STY( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(store_byte(address,regy);,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    store_byte(address, regy);
+    return ok;
 }
 
 // transfer accumulator to X
 static inline bool TAX( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(regx=accumulator;,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    regx = accumulator;
+    return ok;
 }
 
 // transfer accumulator to Y
 static inline bool TAY( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(regy=accumulator;,,,,,);
-    return true;
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    regy = accumulator;
+    return ok;
 }
 
 // transfer stack pointer to X
 static inline bool TSX( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(regx=stackpointer;,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    regx = stackpointer;
+    return ok;
 }
 
 // transfer X to accumulator
 static inline bool TXA( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(accumulator=regx;,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    accumulator = regx;
+    return ok;
 }
 
 // transfer Y to stack pointer
 static inline bool TXS( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(stackpointer=regx;,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    stackpointer = regx;
+    return ok;
 }
 
 // transfer Y to accumulator
 static inline bool TYA( mode_t mode, register_t reg ) {
-    EXECUTE_OPCODE(accumulator=regy;,,,,,);
+    update_status(mode, __func__);
+    bool ok = true;
+    WORD address = 0x0000;
+    BYTE value = 0x00;
+    resolve_address(mode, reg, &address, &value);
+    accumulator = regy;
+    return ok;
 }
 
 
@@ -488,6 +1045,15 @@ bool execute(BYTE instruction) {
     WORD address = {0x00};
 
     current_instruction = instruction;
+
+    // account base cycles for this opcode (refine with addressing penalties later)
+    cycles += opcode_cycles[(uint8_t)instruction];
+
+    /* fast-path: if we've registered a table handler for this opcode, use it */
+    opcode_entry_t entry = opcode_table[(uint8_t)instruction];
+    if (entry.handler != NULL) {
+        return entry.handler(entry.mode, entry.reg);
+    }
 
     switch(instruction) {
         case 0x00: OPCALL(BRK,IMP);
@@ -753,10 +1319,23 @@ bool execute(BYTE instruction) {
 bool cpu_init() {
     if (!initialised) { 
         stack = memory + 0x0100;
+        stackpointer = 0xFF; /* 6502 SP starts at 0xFF and grows down */
+        accumulator = 0x00;
+        regx = 0x00;
+        regy = 0x00;
+        procstatus = 0x00;
+        current_instruction = 0x00;
         programcounter = fetch_word(0xFFFE);
+        cycles = 0ULL;
+        init_opcode_cycles();
+        init_opcode_table();
         initialised = true;
     }
     return initialised;
+}
+
+unsigned long long cpu_get_cycles() {
+    return cycles;
 }
 
 bool tick() {
@@ -767,41 +1346,33 @@ bool cpu_test() {
     bool ok = true;
     BYTE val = 0x00;
 
-    int i = 0;
-
     if (!cpu_init()) {
         printf("Initialisation failed\n");
         return false;
     }
 
-    while( PUSH(val) && (i<300) ) val=(2*val + i++) % 0xFF;
-
-    ok = ok && (i == 0xFF);
-
-    while( POP(val) && (i>0) ) i--;
-
-    ok = ok && (i == 0x00);
-    
-    if (!ok) {
-        printf( "basic CPU stack tests failed\n" );
-        return ok;
-    } 
-
-    while( i < 0xFF ) {
-        val = (BYTE)(i & 0xFF);
-        PUSH(val);
-        i++;
-    };
-
-    while( POP(val) && (ok = (val == i))) i--;
-
-    if (!ok) {
-        printf( "advanced CPU stack tests failed\n" );
-        return ok;
+    /* push 0..255 onto stack */
+    for (int i = 0; i < 256; i++) {
+        if (!PUSH((BYTE)i)) {
+            fprintf(stderr, "cpu_test: PUSH failed at %d\n", i);
+            return false;
+        }
     }
 
-    procstatus = 0x00;
+    /* pop and verify LIFO order */
+    for (int i = 255; i >= 0; i--) {
+        if (!POP(val)) {
+            fprintf(stderr, "cpu_test: POP failed at %d\n", i);
+            return false;
+        }
+        if (val != (BYTE)i) {
+            fprintf(stderr, "cpu_test: stack value mismatch expected %d got %d\n", i, val);
+            return false;
+        }
+    }
 
+    /* processor status flag basics */
+    procstatus = 0x00;
     ok = ok && (!CARRY_FLAG);
     ok = ok && (!ZERO_FLAG);
     ok = ok && (!INTERRUPT_FLAG);
@@ -809,14 +1380,9 @@ bool cpu_test() {
     ok = ok && (!BREAK_FLAG);
     ok = ok && (!OVERFLOW_FLAG);
     ok = ok && (!NEGATIVE_FLAG);
-
-    if (!ok) {
-        printf("basic tests procstatus flags (reset) failed\n" );
-        return ok;
-    }
+    if (!ok) return ok;
 
     procstatus = 0xFF;
-
     ok = ok && (CARRY_FLAG);
     ok = ok && (ZERO_FLAG);
     ok = ok && (INTERRUPT_FLAG);
@@ -824,44 +1390,20 @@ bool cpu_test() {
     ok = ok && (BREAK_FLAG);
     ok = ok && (OVERFLOW_FLAG);
     ok = ok && (NEGATIVE_FLAG);
-
-    if (!ok) {
-        printf("basic tests procstatus flags (set) failed\n" );
-        return ok;
-    }
+    if (!ok) return ok;
 
     procstatus = 0x00;
-
     CARRY_SET;
     ok = ok && (CARRY_FLAG);
     CARRY_CLEAR;
     ok = ok && (!CARRY_FLAG);
+    if (!ok) return ok;
 
-    if (!ok) {
-        printf("basic tests procstatus CARRY flag (set/reset) failed\n");
-        return ok;
-    }
-
-    ok = ok && execute(0xF8);  // opcode for SED
-    if (!ok) {
-        printf("execution of opcode 0xF8 (SED) failed\n");
-        return ok;
-    }
+    /* test a couple of opcode executions that affect flags */
+    ok = ok && execute(0xF8);  // SED
     ok = ok && (DECIMAL_FLAG);
-    if (!ok) {
-        printf("Decimal flag was not set\n");
-        return ok;
-    }
-    ok = ok && execute(0xD8); // opcode for CLD
-    if (!ok) {
-        printf("execution of opcode 0XD8 (CLD) failed\n");        
-        return ok;
-    }
+    ok = ok && execute(0xD8);  // CLD
     ok = ok && (!DECIMAL_FLAG);
-    if (!ok) {
-        printf("Decimal flag was not reset\n");
-        return ok;
-    }
 
     return ok;
 }
